@@ -1,62 +1,100 @@
-import { getBodyBuffer } from '@/utils/body';
 import {
   getProxyHeaders,
   getAfterResponseHeaders,
   getBlacklistedHeaders,
 } from '@/utils/headers';
-import {
-  createTokenIfNeeded,
-  isAllowedToMakeRequest,
-  setTokenHeader,
-} from '@/utils/turnstile';
+import { specificProxyRequest } from '@/utils/proxy';
+
+/**
+ * Rewrites relative and absolute URLs in M3U8 manifest to go through the proxy.
+ */
+function rewriteM3U8(content: string, baseUrl: string, proxyUrl: string): string {
+  const lines = content.split('\n');
+  const rewrittenLines = lines.map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return line;
+
+    // Handle URI attributes in tags (Keys, Maps, etc)
+    const uriMatch = line.match(/(URI=["'])([^"']+)(["'])/);
+    if (uriMatch) {
+      const originalUri = uriMatch[2];
+      const absoluteUri = new URL(originalUri, baseUrl).href;
+      const proxiedUri = `${proxyUrl}/?destination=${encodeURIComponent(absoluteUri)}`;
+      return line.replace(uriMatch[0], `${uriMatch[1]}${proxiedUri}${uriMatch[3]}`);
+    }
+
+    // Handle segment/playlist URLs (lines not starting with #)
+    if (!trimmed.startsWith('#')) {
+      const absoluteUri = new URL(trimmed, baseUrl).href;
+      return `${proxyUrl}/?destination=${encodeURIComponent(absoluteUri)}`;
+    }
+
+    return line;
+  });
+  return rewrittenLines.join('\n');
+}
 
 export default defineEventHandler(async (event) => {
-  // handle cors, if applicable
+  // handle cors
   if (isPreflightRequest(event)) return handleCors(event, {});
 
-  // parse destination URL
-  const destination = getQuery<{ destination?: string }>(event).destination;
-  if (!destination)
-    return await sendJson({
-      event,
-      status: 200,
-      data: {
-        message: `Proxy is working as expected (v${
-          useRuntimeConfig(event).version
-        })`,
-      },
-    });
+  const query = getQuery(event);
+  let destination = (query.destination || query.url) as string;
 
-  if (!(await isAllowedToMakeRequest(event)))
-    return await sendJson({
-      event,
-      status: 401,
-      data: {
-        error: 'Invalid or missing token',
-      },
-    });
+  // Handle catch-all for relative paths (if destination is missing)
+  if (!destination) {
+    const referer = getHeader(event, 'referer');
+    if (referer && referer.includes('destination=')) {
+      try {
+        const refererUrl = new URL(referer);
+        const prevDest = refererUrl.searchParams.get('destination') || refererUrl.searchParams.get('url');
+        if (prevDest) {
+          const base = new URL(prevDest);
+          destination = new URL(event.path, base.origin + base.pathname).href;
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+  }
 
-  // read body
-  const body = await getBodyBuffer(event);
-  const token = await createTokenIfNeeded(event);
+  if (!destination) {
+    return {
+      message: `Proxy is working (v${useRuntimeConfig(event).version})`,
+      usage: '/?destination=<url> or /?url=<url>',
+    };
+  }
 
-  // proxy
+  const proxyUrl = `${getRequestProtocol(event)}://${getRequestHost(event)}`;
+
   try {
-    await specificProxyRequest(event, destination, {
+    return await specificProxyRequest(event, destination, {
       blacklistedHeaders: getBlacklistedHeaders(),
       fetchOptions: {
         redirect: 'follow',
         headers: getProxyHeaders(event.headers),
-        body,
       },
-      onResponse(outputEvent, response) {
+      async onResponse(outputEvent, response) {
         const headers = getAfterResponseHeaders(response.headers, response.url);
         setResponseHeaders(outputEvent, headers);
-        if (token) setTokenHeader(event, token);
+
+        const contentType = response.headers.get('content-type') || '';
+        const isM3U8 = contentType.includes('mpegurl') || destination.endsWith('.m3u8');
+
+        if (isM3U8) {
+          const body = await response.text();
+          const rewritten = rewriteM3U8(body, destination, proxyUrl);
+          // @ts-ignore
+          outputEvent.node.res.end(rewritten);
+        }
       },
     });
-  } catch (e) {
-    console.log('Error fetching', e);
-    throw e;
+  } catch (e: any) {
+    console.error('Proxy error:', e);
+    return sendJson({
+      event,
+      status: 500,
+      data: { error: e.message },
+    });
   }
 });
