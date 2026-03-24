@@ -37,18 +37,32 @@ function copyHeader(
 export function getProxyHeaders(headers: Headers): Headers {
   const output = new Headers();
 
-  // default user agent
-  output.set(
-    'User-Agent',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:93.0) Gecko/20100101 Firefox/93.0',
-  );
-
-  Object.entries(headerMap).forEach((entry) => {
-    copyHeader(headers, output, entry[0], entry[1]);
+  // Forward all headers from the incoming request except Cloudflare infra headers
+  headers.forEach((value, key) => {
+    const lower = key.toLowerCase();
+    if (!blacklistedHeaders.includes(lower)) {
+      output.set(key, value);
+    }
   });
+
+  // Apply X-* header remappings (e.g. X-Cookie -> Cookie)
+  Object.entries(headerMap).forEach((entry) => {
+    if (headers.has(entry[0])) {
+      output.set(entry[1], headers.get(entry[0]) ?? '');
+    }
+  });
+
+  // Use a modern Chrome UA if none was provided
+  if (!output.has('User-Agent')) {
+    output.set(
+      'User-Agent',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    );
+  }
 
   return output;
 }
+
 
 export function getAfterResponseHeaders(
   headers: Headers,
