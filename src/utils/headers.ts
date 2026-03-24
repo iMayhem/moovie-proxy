@@ -21,8 +21,11 @@ const blacklistedHeaders = [
   'forwarded',
   'x-real-ip',
   'content-length',
+  'host',
+  'connection',
   ...Object.keys(headerMap),
 ];
+
 
 function copyHeader(
   headers: Headers,
